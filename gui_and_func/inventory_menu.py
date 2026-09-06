@@ -23,20 +23,21 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
     QHeaderView,
+    QAbstractItemView,
     QInputDialog,
     QProgressDialog,
+    QStyledItemDelegate,
     QWidget,
 )
-from PySide6.QtGui import QIcon, QPixmap, QCursor, QShortcut, QKeySequence
+from PySide6.QtGui import QIcon, QPixmap, QCursor, QShortcut, QKeySequence, QColor, QBrush, QPen, QPainter, QFont
 from PySide6.QtCore import Qt, QEvent, QTimer
 import threading
 
 try:
-    from .export_utils import export_inventory_to_csv, export_inventory_to_json, generate_low_stock_report
+    from .export_utils import export_inventory_to_csv, export_inventory_to_json
 except ImportError:
     export_inventory_to_csv = None
     export_inventory_to_json = None
-    generate_low_stock_report = None
 
 try:
     from database import database as db
@@ -54,6 +55,18 @@ except ModuleNotFoundError:
         def ensure_inventory_table():
             pass
 
+try:
+    from .theme_manager import TEXT_PRIMARY
+except ImportError:
+    from gui_and_func.theme_manager import TEXT_PRIMARY
+
+LOW_STOCK_THRESHOLD = 10
+STOCK_OUT_BORDER = "#D50000"
+STOCK_OUT_BG = "#FFE1E1"
+STOCK_LOW_BORDER = "#FF9800"
+STOCK_LOW_BG = "#FFF6CC"
+STOCK_ALERT_ROLE = Qt.ItemDataRole.UserRole + 20
+
 _view_dialog = None
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
@@ -65,6 +78,151 @@ _PIXMAP_CACHE = {
 }
 _MAX_CACHE_BYTES = 50 * 1024 * 1024
 _MAX_CACHED_PIXMAPS = 500
+
+
+def _stock_priority(quantity: int) -> int:
+    qty = int(quantity or 0)
+    if qty <= 0:
+        return 0
+    if qty < LOW_STOCK_THRESHOLD:
+        return 1
+    return 2
+
+
+def _sort_stock_alerts_first(rows: list) -> list:
+    def _key(row):
+        qty = int(row.get("quantity") or 0)
+        priority = _stock_priority(qty)
+        return (priority, qty if priority < 2 else 0, -int(row.get("id") or 0))
+
+    return sorted(rows, key=_key)
+
+
+def _stock_alert_state(quantity: int) -> str:
+    qty = int(quantity or 0)
+    if qty <= 0:
+        return "out"
+    if qty < LOW_STOCK_THRESHOLD:
+        return "low"
+    return "ok"
+
+
+def _stock_alert_text(quantity: int) -> str:
+    qty = int(quantity or 0)
+    if qty <= 0:
+        return "Out of stock"
+    if qty < LOW_STOCK_THRESHOLD:
+        return f"Low stock: {qty}"
+    return f"Stock: {qty}"
+
+
+class StockAlertRowDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        state = index.data(STOCK_ALERT_ROLE)
+        if state not in ("out", "low"):
+            return
+
+        color = STOCK_OUT_BORDER if state == "out" else STOCK_LOW_BORDER
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setPen(QPen(QColor(color), 2))
+        rect = option.rect.adjusted(1, 1, -1, -1)
+        painter.drawLine(rect.topLeft(), rect.topRight())
+        painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+        if index.column() == 0:
+            painter.drawLine(rect.topLeft(), rect.bottomLeft())
+        if index.column() == index.model().columnCount() - 1:
+            painter.drawLine(rect.topRight(), rect.bottomRight())
+        painter.restore()
+
+
+class StockBadgeButton(QPushButton):
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._badge = QLabel()
+        self._badge.setParent(self)
+        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._badge.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._badge.hide()
+        self._badge_host = None
+
+    def update_badge(self, count: int):
+        count = int(count or 0)
+        if count <= 0:
+            self._badge.hide()
+            self.setToolTip("No low stock items")
+            return
+
+        text = "99+" if count > 99 else str(count)
+        width = 18 if len(text) <= 2 else 24
+        height = 18
+        self._sync_badge_host()
+        self._badge.setText(text)
+        self._badge.setFixedSize(width, height)
+        self._badge.setStyleSheet(f"""
+            QLabel {{
+                background-color: {STOCK_OUT_BORDER};
+                color: white;
+                border: 1.5px solid white;
+                border-radius: {height // 2}px;
+                font-size: 9px;
+                font-weight: 800;
+            }}
+        """)
+        self._badge.show()
+        self.setToolTip(f"{count} item{'s' if count != 1 else ''} need stock attention")
+        self._position_badge()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_badge_host()
+        self._position_badge()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_badge()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._position_badge()
+
+    def eventFilter(self, obj, event):
+        if obj is self._badge_host and event.type() in (
+            QEvent.Type.Resize,
+            QEvent.Type.Move,
+            QEvent.Type.Show,
+            QEvent.Type.LayoutRequest,
+        ):
+            self._position_badge()
+        return super().eventFilter(obj, event)
+
+    def _sync_badge_host(self):
+        host = self.parentWidget() or self
+        if host is self._badge_host:
+            return
+        if self._badge_host is not None:
+            try:
+                self._badge_host.removeEventFilter(self)
+            except Exception:
+                pass
+        self._badge_host = host
+        self._badge.setParent(host)
+        try:
+            host.installEventFilter(self)
+        except Exception:
+            pass
+
+    def _position_badge(self):
+        if self._badge.isHidden():
+            return
+        host = self._badge_host or self.parentWidget() or self
+        top_left = self.mapTo(host, self.rect().topLeft())
+        x = top_left.x() + self.width() - self._badge.width() + 5
+        y = top_left.y() - 7
+        self._badge.move(int(x), int(y))
+        self._badge.raise_()
 
 
 def _project_root() -> str:
@@ -438,10 +596,10 @@ class AddItemDialog(QDialog):
         qty = int(self.qty_spin.value())
 
         if not name:
-            QMessageBox.warning(self, "Validation", "Name is required.")
+            QMessageBox.NoIcon(self, "Validation", "Name is required.")
             return
         if price < 0 or qty < 0:
-            QMessageBox.warning(self, "Validation", "Price and Quantity must be non-negative.")
+            QMessageBox.NoIcon(self, "Validation", "Price and Quantity must be non-negative.")
             return
 
         price = self.price_spin.value()
@@ -559,7 +717,7 @@ class EditItemDialog(QDialog):
         if file_path:
             try:
                 if os.path.getsize(file_path) > _MAX_IMAGE_BYTES:
-                    QMessageBox.warning(self, "Image too large", "Please choose an image smaller than 5 MB.")
+                    QMessageBox.NoIcon(self, "Image too large", "Please choose an image smaller than 5 MB.")
                     return
             except Exception:
                 pass
@@ -572,10 +730,10 @@ class EditItemDialog(QDialog):
         qty = int(self.qty_spin.value())
         category = self.category_combo.currentText()
         if not name:
-            QMessageBox.warning(self, "Validation", "Name is required.")
+            QMessageBox.NoIcon(self, "Validation", "Name is required.")
             return
         if price < 0 or qty < 0:
-            QMessageBox.warning(self, "Validation", "Price and Quantity must be non-negative.")
+            QMessageBox.NoIcon(self, "Validation", "Price and Quantity must be non-negative.")
             return
         self.save_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
@@ -628,8 +786,10 @@ class ViewItemsDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(self.table.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(self.table.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.setMouseTracking(True)
+        self.table.setItemDelegate(StockAlertRowDelegate(self.table))
         self.table.cellEntered.connect(self._on_cell_entered)
 
         self.resize(1200, 550)
@@ -650,7 +810,7 @@ class ViewItemsDialog(QDialog):
         self.delete_btn = QPushButton("🗑 Delete")
         self.export_csv_btn = QPushButton("📊 Export CSV")
         self.export_json_btn = QPushButton("📄 Export JSON")
-        self.low_stock_btn = QPushButton("⚠ Low Stock")
+        self.low_stock_btn = StockBadgeButton("Stock Alerts")
         self.close_btn = QPushButton("Close")
         
         self.refresh_btn.clicked.connect(self.refresh_async)
@@ -658,7 +818,7 @@ class ViewItemsDialog(QDialog):
         self.delete_btn.clicked.connect(self._on_delete)
         self.export_csv_btn.clicked.connect(self._export_csv)
         self.export_json_btn.clicked.connect(self._export_json)
-        self.low_stock_btn.clicked.connect(self._generate_low_stock_report)
+        self.low_stock_btn.clicked.connect(self._show_stock_alerts)
         self.close_btn.clicked.connect(self.close)
         
         for b in (self.refresh_btn, self.edit_btn, self.delete_btn):
@@ -683,6 +843,7 @@ class ViewItemsDialog(QDialog):
         layout.addWidget(shortcuts_label)
 
         self._all_rows = []
+        self.low_stock_btn.update_badge(0)
         self.refresh_async()
 
     def refresh_table(self):
@@ -700,9 +861,9 @@ class ViewItemsDialog(QDialog):
                 except Exception:
                     return False
             rows = [r for r in rows if _match(r)]
-        self._view_rows = rows
+        self._view_rows = _sort_stock_alerts_first(rows)
         self.table.setRowCount(0)
-        for row in rows:
+        for row in self._view_rows:
             r = self.table.rowCount()
             self.table.insertRow(r)
             self.table.setItem(r, 0, QTableWidgetItem(str(row["id"])) )
@@ -715,10 +876,50 @@ class ViewItemsDialog(QDialog):
             self.table.setItem(r, 3, QTableWidgetItem(str(row["quantity"])) )
             self.table.setItem(r, 4, QTableWidgetItem(f"{row['price']:.2f}") )
             self.table.setItem(r, 5, QTableWidgetItem(row.get("updated_at_str") or ""))
+            self._style_stock_row(r, int(row.get("quantity") or 0))
 
+        self._update_stock_alert_badge()
         self._icon_cursor = 0
         if not self._icon_timer.isActive():
             self._icon_timer.start()
+
+    def _style_stock_row(self, row_index: int, quantity: int):
+        state = _stock_alert_state(quantity)
+        if state == "out":
+            accent = STOCK_OUT_BORDER
+            background = STOCK_OUT_BG
+            tooltip = "Out of stock"
+        elif state == "low":
+            accent = STOCK_LOW_BORDER
+            background = STOCK_LOW_BG
+            tooltip = f"Low stock: {quantity}"
+        else:
+            accent = TEXT_PRIMARY
+            background = None
+            tooltip = f"Stock: {quantity}"
+
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row_index, col)
+            if not item:
+                continue
+            if background:
+                item.setBackground(QBrush(QColor(background)))
+            item.setForeground(QBrush(QColor(accent if col == 3 else TEXT_PRIMARY)))
+            item.setToolTip(tooltip)
+            item.setData(STOCK_ALERT_ROLE, state)
+            if state in ("out", "low"):
+                font = item.font()
+                font.setWeight(QFont.Weight.DemiBold)
+                item.setFont(font)
+
+        qty_item = self.table.item(row_index, 3)
+        if qty_item and quantity < LOW_STOCK_THRESHOLD:
+            qty_item.setText(f"{quantity}  {tooltip}")
+
+    def _update_stock_alert_badge(self):
+        rows = getattr(self, "_all_rows", [])
+        count = sum(1 for row in rows if int(row.get("quantity") or 0) < LOW_STOCK_THRESHOLD)
+        self.low_stock_btn.update_badge(count)
 
     def _on_search_changed(self, _text: str):
         self._apply_filter_and_rebuild()
@@ -855,20 +1056,93 @@ class ViewItemsDialog(QDialog):
         if export_inventory_to_csv:
             export_inventory_to_csv(self._view_rows if hasattr(self, '_view_rows') else self._all_rows, self)
         else:
-            QMessageBox.warning(self, "Not Available", "Export functionality not available")
+            QMessageBox.NoIcon(self, "Not Available", "Export functionality not available")
     
     def _export_json(self):
         if export_inventory_to_json:
             export_inventory_to_json(self._view_rows if hasattr(self, '_view_rows') else self._all_rows, self)
         else:
-            QMessageBox.warning(self, "Not Available", "Export functionality not available")
+            QMessageBox.NoIcon(self, "Not Available", "Export functionality not available")
     
-    def _generate_low_stock_report(self):
-        if generate_low_stock_report:
-            low_stock = _get_low_stock_items(10)
-            generate_low_stock_report(low_stock, 10, self)
-        else:
-            QMessageBox.warning(self, "Not Available", "Report generation not available")
+    def _show_stock_alerts(self):
+        rows = [
+            row for row in getattr(self, "_all_rows", [])
+            if int(row.get("quantity") or 0) < LOW_STOCK_THRESHOLD
+        ]
+        if not rows:
+            QMessageBox.information(self, "Stock Alerts", "All items are stocked above the low-stock threshold.")
+            return
+        dlg = StockAlertsDialog(_sort_stock_alerts_first(rows), LOW_STOCK_THRESHOLD, self)
+        dlg.exec()
+
+
+class StockAlertsDialog(QDialog):
+    def __init__(self, rows: list, threshold: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stock Alerts")
+        self.setModal(True)
+        self.resize(760, 440)
+
+        out_count = sum(1 for row in rows if int(row.get("quantity") or 0) <= 0)
+        low_count = sum(1 for row in rows if 0 < int(row.get("quantity") or 0) < threshold)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("Stock Alerts")
+        title.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 20px; font-weight: 800; background: transparent;")
+        layout.addWidget(title)
+
+        summary = QLabel(f"{out_count} out of stock  |  {low_count} low stock below {threshold}")
+        summary.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 13px; font-weight: 600; background: transparent;")
+        layout.addWidget(summary)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["ID", "Name", "Category", "Quantity", "Status"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setItemDelegate(StockAlertRowDelegate(self.table))
+        layout.addWidget(self.table, 1)
+
+        for row in rows:
+            self._add_row(row)
+
+        close_btn = QPushButton("Close")
+        close_btn.setMinimumHeight(38)
+        close_btn.clicked.connect(self.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _add_row(self, row: dict):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        qty = int(row.get("quantity") or 0)
+        state = _stock_alert_state(qty)
+        background = STOCK_OUT_BG if state == "out" else STOCK_LOW_BG
+        accent = STOCK_OUT_BORDER if state == "out" else STOCK_LOW_BORDER
+        status = _stock_alert_text(qty)
+        values = [
+            str(row.get("id", "")),
+            str(row.get("name", "")),
+            str(row.get("category") or ""),
+            str(qty),
+            status,
+        ]
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setData(STOCK_ALERT_ROLE, state)
+            item.setBackground(QBrush(QColor(background)))
+            item.setForeground(QBrush(QColor(accent if col in (3, 4) else TEXT_PRIMARY)))
+            item.setToolTip(status)
+            font = item.font()
+            font.setWeight(QFont.Weight.DemiBold)
+            item.setFont(font)
+            self.table.setItem(r, col, item)
 
 def on_view():
     global _view_dialog

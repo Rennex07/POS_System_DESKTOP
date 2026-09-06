@@ -5,6 +5,7 @@ import webbrowser
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
+from html import escape
 
 
 @dataclass
@@ -13,6 +14,7 @@ class ReceiptItem:
     quantity: int
     unit_price: float
     subtotal: float
+    note: str = ""
 
 
 @dataclass
@@ -22,6 +24,14 @@ class ReceiptData:
     items: List[ReceiptItem]
     total: float
     currency: str = "USD"
+    exchange_rate: float = 4100.0 # default exchange rate
+
+# round up to the next 100 KHR
+def round_up_khr(amount: float) -> int:
+    amount = round(float(amount or 0), 6)
+    if amount <= 0:
+        return 0
+    return int(math.ceil(amount / 100.0) * 100)
 
 
 class PDFGenerator:
@@ -36,6 +46,7 @@ class PDFGenerator:
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(html_content)
         
+        # auto open the file to default web browser
         if auto_open:
             webbrowser.open(f"file://{filepath}")
         
@@ -45,15 +56,21 @@ class PDFGenerator:
     def _create_receipt_html(data: ReceiptData) -> str:
         items_html = ""
         for item in data.items:
+            item_name = escape(item.name)
+            note = escape(str(item.note or "").strip())
+            note_html = f'<div class="item-note">Note: {note}</div>' if note else ""
             items_html += f"""
                 <tr>
-                    <td class="item-name">{item.name}</td>
+                    <td class="item-name">{item_name}{note_html}</td>
                     <td class="qty">{item.quantity}</td>
                     <td class="price">${item.unit_price:.2f}</td>
                     <td class="subtotal">${item.subtotal:.2f}</td>
                 </tr>
             """
         
+        khr_total = round_up_khr(data.total * data.exchange_rate)
+        
+        # HTML Format for receipt | kw:receipt html
         return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -112,6 +129,11 @@ class PDFGenerator:
             overflow: hidden;
             text-overflow: ellipsis;
         }}
+        .item-note {{
+            color: #666;
+            font-size: 10px;
+            margin-top: 2px;
+        }}
         .qty, .price, .subtotal {{
             text-align: right;
         }}
@@ -125,6 +147,12 @@ class PDFGenerator:
             justify-content: space-between;
             font-weight: bold;
             font-size: 14px;
+        }}
+        .khr-total {{
+            text-align: center;
+            font-size: 11px;
+            color: #666;
+            margin-top: 5px;
         }}
         .footer {{
             text-align: center;
@@ -179,6 +207,9 @@ class PDFGenerator:
             <span>TOTAL:</span>
             <span>${data.total:.2f} {data.currency}</span>
         </div>
+        <div class="khr-total">
+            ({khr_total:,.0f} KHR)
+        </div>
     </div>
     
     <div class="footer">
@@ -228,6 +259,7 @@ class PDFGenerator:
     ) -> str:
         month_name = datetime(year, month, 1).strftime("%B %Y")
         
+        # monthly sale report html content | kw:monthly report html
         txn_rows = ""
         for txn in transactions:
             txn_rows += f"""

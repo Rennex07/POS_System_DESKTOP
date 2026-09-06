@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 def setup_logging():
@@ -18,8 +19,14 @@ from PySide6.QtWidgets import (
     QPushButton, QStackedWidget, QFrame, QDialog, QProgressBar, QMessageBox,
     QGridLayout, QSizePolicy, QGraphicsOpacityEffect
 )
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QLinearGradient
+
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except ImportError:
+    def _qt_is_valid(obj):
+        return obj is not None
 
 from database import database as db, handlers
 from gui_and_func.inventory_menu import get_cache_stats, _get_low_stock_items
@@ -138,6 +145,56 @@ NAV_BTN_STYLE = f"""
     }}
 """
 
+COLLAPSED_NAV_BTN_STYLE = f"""
+    QPushButton {{
+        background-color: transparent;
+        color: {TEXT_SECONDARY};
+        border: none;
+        border-radius: 10px;
+        padding: 0;
+        text-align: center;
+        font-size: 18px;
+        font-weight: 600;
+    }}
+    QPushButton:hover {{
+        background-color: {GREEN_LIGHT};
+        color: {GREEN};
+    }}
+    QPushButton:checked {{
+        background-color: {GREEN};
+        color: white;
+        font-weight: 700;
+    }}
+"""
+
+COLLAPSED_EXIT_BTN_STYLE = """
+    QPushButton {
+        background-color: transparent;
+        color: #E74C3C;
+        border: none;
+        border-radius: 10px;
+        padding: 0;
+        text-align: center;
+        font-size: 18px;
+        font-weight: 700;
+    }
+    QPushButton:hover { background-color: #FDEDEC; }
+"""
+
+EXIT_BTN_STYLE = """
+    QPushButton {
+        background-color: transparent;
+        color: #E74C3C;
+        border: none;
+        border-radius: 10px;
+        padding: 12px 18px;
+        text-align: left;
+        font-size: 14px;
+        font-weight: 500;
+    }
+    QPushButton:hover { background-color: #FDEDEC; }
+"""
+
 SIDEBAR_STYLE = f"""
     QFrame#sidebar {{
         background-color: {BG_WHITE};
@@ -146,21 +203,101 @@ SIDEBAR_STYLE = f"""
 """
 
 
+class SplashScreen(QWidget):
+    """Tiny frameless splash shown the instant QApplication starts, while
+    the real MainWindow (DB connect + view construction) builds in the
+    background. Keeps launch feeling instant instead of staring at nothing."""
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.SplashScreen | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(200, 120)
+
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        self.move(
+            screen_geo.center().x() - self.width() // 2,
+            screen_geo.center().y() - self.height() // 2,
+        )
+
+        self._angle = 0
+        self._status = "Starting..."
+        self._spin_timer = QTimer(self)
+        self._spin_timer.timeout.connect(self._spin)
+        self._spin_timer.start(16)
+
+        self._opacity_effect = QGraphicsOpacityEffect(self)
+        self._opacity_effect.setOpacity(0.0)
+        self.setGraphicsEffect(self._opacity_effect)
+
+        self._fade_anim = QPropertyAnimation(self._opacity_effect, b"opacity", self)
+
+    def _spin(self):
+        self._angle = (self._angle + 6) % 360
+        self.update()
+
+    def start(self):
+        """Show and fade in. Call immediately after QApplication is created."""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._fade_anim.stop()
+        self._fade_anim.setDuration(140)
+        self._fade_anim.setStartValue(self._opacity_effect.opacity())
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_anim.start()
+
+    def set_status(self, text: str):
+        """Update the status line. This is the ONLY loading indicator in the
+        app now — do not pop a second dialog on top of it (e.g. for DB
+        connect); update this instead so there's one continuous screen."""
+        self._status = text
+        self.update()
+
+    def finish(self):
+        """Fade out and close. Call once the real window is ready to show."""
+        self._spin_timer.stop()
+        self._fade_anim.stop()
+        self._fade_anim.setDuration(160)
+        self._fade_anim.setStartValue(self._opacity_effect.opacity())
+        self._fade_anim.setEndValue(0.0)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._fade_anim.finished.connect(self.close)
+        self._fade_anim.start()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(QColor(BORDER), 1))
+        painter.setBrush(QBrush(QColor(BG_WHITE)))
+        painter.drawRoundedRect(rect, 16, 16)
+
+        painter.setPen(QColor(TEXT_PRIMARY))
+        painter.setFont(QFont("Segoe UI", 11, QFont.Weight.DemiBold))
+        painter.drawText(rect.adjusted(0, 18, 0, -60), Qt.AlignmentFlag.AlignCenter, "POS System")
+
+        center = rect.center()
+        cx, cy = center.x(), center.y() + 14
+        radius = 12
+        pen = QPen(QColor(GREEN))
+        pen.setWidth(3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        span_angle = 100 * 16
+        start_angle = int(-self._angle * 16)
+        painter.drawArc(cx - radius, cy - radius, radius * 2, radius * 2, start_angle, span_angle)
+
+        painter.setPen(QColor(TEXT_MUTED))
+        painter.setFont(QFont("Segoe UI", 9))
+        painter.drawText(rect.adjusted(10, 0, -10, -14), Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter, self._status)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("POS System")
-
-        screen = QApplication.primaryScreen()
-        screen_geometry = screen.availableGeometry()
-        width = int(screen_geometry.width() * 0.92)
-        height = int(screen_geometry.height() * 0.9)
-        self.resize(width, height)
-
-        x = (screen_geometry.width() - width) // 2
-        y = (screen_geometry.height() - height) // 2
-        self.move(x, y)
-
         self.setMinimumSize(1000, 700)
 
         optimal_workers = max(4, min(8, (os.cpu_count() or 4) * 2))
@@ -174,22 +311,24 @@ class MainWindow(QMainWindow):
         self._opening_animation = None
         self._page_animation = None
         self._page_transition_overlay = None
-
-        self._connect_with_dialog()
+        self._page_transition_generation = 0
+        self._sidebar_expanded_width = 210
+        self._sidebar_collapsed_width = 58
+        self._sidebar_is_expanded = False
+        self._sidebar_animation = None
 
         self.central = QWidget()
         self.central.setStyleSheet(f"background-color: {BG_MAIN};")
         self.setCentralWidget(self.central)
         self.main_layout = QHBoxLayout(self.central)
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setContentsMargins(self._sidebar_collapsed_width, 0, 0, 0)
         self.main_layout.setSpacing(0)
-
-        self._create_sidebar()
 
         self.content_stack = QStackedWidget()
         self.content_stack.setStyleSheet(f"background-color: {BG_MAIN};")
         self.main_layout.addWidget(self.content_stack, 1)
 
+        self._create_sidebar()
         self._create_views()
 
         self.show_home()
@@ -206,11 +345,27 @@ class MainWindow(QMainWindow):
         self._fade_content_overlay(duration=160, start_opacity=0.85, store_as_opening=True)
 
     def _fade_content_overlay(self, duration=140, start_opacity=0.65, store_as_opening=False):
+        self._page_transition_generation += 1
+        generation = self._page_transition_generation
+
         if self._page_animation:
-            self._page_animation.stop()
+            try:
+                self._page_animation.stop()
+            except RuntimeError:
+                pass
+            try:
+                self._page_animation.deleteLater()
+            except RuntimeError:
+                pass
+            self._page_animation = None
         if self._page_transition_overlay:
-            self._page_transition_overlay.deleteLater()
+            try:
+                self._page_transition_overlay.deleteLater()
+            except RuntimeError:
+                pass
             self._page_transition_overlay = None
+        if store_as_opening:
+            self._opening_animation = None
 
         overlay = QFrame(self.content_stack)
         overlay.setStyleSheet(f"background-color: {BG_MAIN}; border: none;")
@@ -222,14 +377,17 @@ class MainWindow(QMainWindow):
         effect.setOpacity(start_opacity)
         overlay.setGraphicsEffect(effect)
 
-        animation = QPropertyAnimation(effect, b"opacity", self)
+        animation = QPropertyAnimation(effect, b"opacity", overlay)
         animation.setDuration(duration)
         animation.setStartValue(start_opacity)
         animation.setEndValue(0.0)
         animation.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         def cleanup():
-            overlay.deleteLater()
+            if generation != self._page_transition_generation:
+                return
+            if _qt_is_valid(overlay):
+                overlay.deleteLater()
             self._page_animation = None
             self._page_transition_overlay = None
             if store_as_opening:
@@ -263,22 +421,30 @@ class MainWindow(QMainWindow):
         return dialog.exec()
 
     def _create_sidebar(self):
-        sidebar = QFrame()
+        sidebar = QFrame(self.central)
         sidebar.setObjectName("sidebar")
         sidebar.setStyleSheet(SIDEBAR_STYLE)
-        sidebar.setFixedWidth(210)
+        sidebar.setMinimumWidth(self._sidebar_collapsed_width)
+        sidebar.setMaximumWidth(self._sidebar_expanded_width)
+        sidebar.setGeometry(0, 0, self._sidebar_collapsed_width, self.central.height())
+        sidebar.raise_()
+        sidebar.show()
+        self.sidebar = sidebar
 
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(12, 20, 12, 20)
+        sidebar_layout.setContentsMargins(8, 14, 8, 14)
         sidebar_layout.setSpacing(4)
 
         logo_row = QHBoxLayout()
         logo_row.setSpacing(8)
         logo_icon = QLabel("●")
-        logo_icon.setStyleSheet(f"color: {GREEN}; font-size: 22px;")
-        logo_icon.setFixedWidth(28)
+        logo_icon.setText("POS")
+        logo_icon.setStyleSheet(f"color: {GREEN}; font-size: 13px; font-weight: 800;")
+        logo_icon.setFixedWidth(38)
+        logo_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo_text = QLabel("POS System")
         logo_text.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 17px; font-weight: 700;")
+        self.sidebar_logo_text = logo_text
         logo_row.addWidget(logo_icon)
         logo_row.addWidget(logo_text)
         logo_row.addStretch()
@@ -295,15 +461,24 @@ class MainWindow(QMainWindow):
             ("📊  Analytics", self.show_analytics),
         ]
 
-        for text, handler in nav_items:
+        self._sidebar_button_labels = []
+        nav_items = [
+            ("Tables / Orders", "1", self.show_ordering),
+            ("Inventory", "2", self.show_inventory),
+            ("Transactions", "3", self.show_transactions),
+            ("Analytics", "4", self.show_analytics),
+        ]
+
+        for text, short_text, handler in nav_items:
             btn = QPushButton(text)
             btn.setStyleSheet(NAV_BTN_STYLE)
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(handler)
+            btn.clicked.connect(lambda _, h=handler: (self._set_sidebar_expanded(True), h()))
             btn.setMinimumHeight(42)
             sidebar_layout.addWidget(btn)
             self.nav_buttons.append(btn)
+            self._sidebar_button_labels.append((btn, text, short_text))
 
         sidebar_layout.addStretch()
 
@@ -313,42 +488,70 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(sep)
         sidebar_layout.addSpacing(8)
 
+        settings_btn = QPushButton("⚙  Settings")
+        settings_btn.setStyleSheet(NAV_BTN_STYLE)
+        settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings_btn.clicked.connect(lambda _=False: (self._set_sidebar_expanded(True), self._show_settings_dialog()))
+        settings_btn.setMinimumHeight(42)
+        sidebar_layout.addWidget(settings_btn)
+        self._sidebar_button_labels.append((settings_btn, "Settings", "⚙"))
+
         exit_btn = QPushButton("🚪  Exit")
-        exit_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: transparent;
-                color: #E74C3C;
-                border: none;
-                border-radius: 10px;
-                padding: 12px 18px;
-                text-align: left;
-                font-size: 14px;
-                font-weight: 500;
-            }}
-            QPushButton:hover {{ background-color: #FDEDEC; }}
-        """)
+        exit_btn.setStyleSheet(EXIT_BTN_STYLE)
         exit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         exit_btn.clicked.connect(self.close_application)
         exit_btn.setMinimumHeight(42)
         sidebar_layout.addWidget(exit_btn)
+        self._sidebar_button_labels.append((exit_btn, "Exit", "×"))
 
-        self.main_layout.addWidget(sidebar)
+        sidebar.enterEvent = lambda event: self._set_sidebar_expanded(True)
+        sidebar.leaveEvent = lambda event: self._set_sidebar_expanded(False)
+        self._set_sidebar_expanded(False)
+
+    def _set_sidebar_expanded(self, expanded: bool):
+        self._sidebar_is_expanded = expanded
+        width = self._sidebar_expanded_width if expanded else self._sidebar_collapsed_width
+        if hasattr(self, "sidebar_logo_text"):
+            self.sidebar_logo_text.setVisible(expanded)
+        for btn, full_text, short_text in getattr(self, "_sidebar_button_labels", []):
+            btn.setText(full_text if expanded else short_text)
+            btn.setToolTip(full_text)
+            if full_text == "Exit":
+                btn.setStyleSheet(EXIT_BTN_STYLE if expanded else COLLAPSED_EXIT_BTN_STYLE)
+            else:
+                btn.setStyleSheet(NAV_BTN_STYLE if expanded else COLLAPSED_NAV_BTN_STYLE)
+        if hasattr(self, "sidebar"):
+            self.sidebar.raise_()
+            start = self.sidebar.geometry()
+            end = QRect(0, 0, width, self.central.height())
+            if start == end:
+                return
+            if self._sidebar_animation:
+                self._sidebar_animation.stop()
+            self._sidebar_animation = QPropertyAnimation(self.sidebar, b"geometry", self)
+            self._sidebar_animation.setDuration(170)
+            self._sidebar_animation.setStartValue(start)
+            self._sidebar_animation.setEndValue(end)
+            self._sidebar_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._sidebar_animation.start()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "sidebar"):
+            width = self._sidebar_expanded_width if self._sidebar_is_expanded else self._sidebar_collapsed_width
+            self.sidebar.setGeometry(0, 0, width, self.central.height())
 
     def _create_views(self):
-        self.home_widget = self._create_home_view()
-        self.content_stack.addWidget(self.home_widget)
-
+        # Only the tab that's visible on launch gets built up front.
         self.ordering_widget = OrderingWidget(self)
         self.content_stack.addWidget(self.ordering_widget)
 
-        self.inventory_widget = InventoryWidget(self)
-        self.content_stack.addWidget(self.inventory_widget)
-
-        self.transactions_widget = TransactionsWidget(self)
-        self.content_stack.addWidget(self.transactions_widget)
-
-        self.analytics_widget = StatsDashboardWidget(self)
-        self.content_stack.addWidget(self.analytics_widget)
+        # Inventory / Transactions / Analytics are built lazily on first
+        # visit (see show_inventory / show_transactions / show_analytics)
+        # so launch doesn't pay for widgets nobody has opened yet.
+        self.inventory_widget = None
+        self.transactions_widget = None
+        self.analytics_widget = None
 
     def _create_home_view(self):
         widget = QWidget()
@@ -702,26 +905,34 @@ class MainWindow(QMainWindow):
             btn.setChecked(i == active_index)
 
     def show_home(self):
-        self._switch_page(self.home_widget, 0)
-        self._refresh_dashboard_stats()
+        self.show_ordering()
 
     def show_ordering(self):
-        self._switch_page(self.ordering_widget, 1)
+        self._switch_page(self.ordering_widget, 0)
         if hasattr(self.ordering_widget, 'refresh'):
             self.ordering_widget.refresh()
 
     def show_inventory(self):
-        self._switch_page(self.inventory_widget, 2)
+        if self.inventory_widget is None:
+            self.inventory_widget = InventoryWidget(self)
+            self.content_stack.addWidget(self.inventory_widget)
+        self._switch_page(self.inventory_widget, 1)
         if hasattr(self.inventory_widget, 'refresh'):
             self.inventory_widget.refresh()
 
     def show_transactions(self):
-        self._switch_page(self.transactions_widget, 3)
+        if self.transactions_widget is None:
+            self.transactions_widget = TransactionsWidget(self)
+            self.content_stack.addWidget(self.transactions_widget)
+        self._switch_page(self.transactions_widget, 2)
         if hasattr(self.transactions_widget, 'refresh'):
             self.transactions_widget.refresh()
 
     def show_analytics(self):
-        self._switch_page(self.analytics_widget, 4)
+        if self.analytics_widget is None:
+            self.analytics_widget = StatsDashboardWidget(self)
+            self.content_stack.addWidget(self.analytics_widget)
+        self._switch_page(self.analytics_widget, 3)
         if hasattr(self.analytics_widget, 'refresh'):
             self.analytics_widget.refresh()
 
@@ -746,7 +957,7 @@ class MainWindow(QMainWindow):
                 items_list = "\n".join([f"{item['name']}: {item.get('quantity', 0)} left" for item in low_stock_items[:5]])
                 more_text = f"\n... and {len(low_stock_items) - 5} more" if len(low_stock_items) > 5 else ""
                 msg_box = QMessageBox(self)
-                msg_box.setIcon(QMessageBox.Warning)
+                msg_box.setIcon(QMessageBox.NoIcon)
                 msg_box.setWindowTitle("Low Stock Alert")
                 msg_box.setText(f"{len(low_stock_items)} items are running low!")
                 msg_box.setInformativeText(f"{items_list}{more_text}\n\nConsider restocking soon.")
@@ -761,66 +972,219 @@ class MainWindow(QMainWindow):
         handlers.cleanup()
         self.close()
 
-    def _connect_with_dialog(self):
-        class ConnectingDialog(QDialog):
-            def __init__(self, parent=None):
-                super().__init__(parent)
-                self.setWindowTitle("Starting POS System...")
-                self.setStyleSheet(f"background-color: {BG_WHITE};")
-                layout = QVBoxLayout(self)
-                self.lbl = QLabel("Connecting to database...")
-                self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.lbl.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 14px; background: transparent;")
-                bar = QProgressBar()
-                bar.setRange(0, 0)
-                layout.addWidget(self.lbl)
-                layout.addWidget(bar)
-                self.setModal(True)
-                self.resize(360, 120)
+    def _show_settings_dialog(self):
+        from PySide6.QtWidgets import QCheckBox, QDoubleSpinBox, QSpinBox
 
-        done = threading.Event()
-        err = {"value": None}
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings")
+        dialog.setFixedSize(420, 360)
+        dialog.setStyleSheet(f"background-color: {BG_WHITE};")
 
-        def worker():
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(14)
+        layout.setContentsMargins(24, 22, 24, 22)
+
+        title = QLabel("Settings")
+        title.setStyleSheet(f"font-size: 18px; font-weight: 700; color: {TEXT_PRIMARY}; background: transparent;")
+        layout.addWidget(title)
+
+        rate_frame = QFrame()
+        rate_frame.setStyleSheet(f"background-color: {BG_MAIN}; border-radius: 8px;")
+        rate_layout = QVBoxLayout(rate_frame)
+        rate_layout.setContentsMargins(14, 12, 14, 12)
+        rate_layout.setSpacing(8)
+
+        rate_label = QLabel("Exchange Rate (1 USD = X KHR)")
+        rate_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px; background: transparent;")
+        rate_layout.addWidget(rate_label)
+
+        rate_input = QSpinBox()
+        rate_input.setRange(1, 100000)
+        rate_input.setSuffix(" KHR")
+        rate_input.setStyleSheet(f"""
+            QSpinBox {{
+                background-color: {BG_WHITE};
+                color: {GREEN};
+                border: 1.5px solid {GREEN};
+                border-radius: 8px;
+                padding: 7px 10px;
+                font-size: 15px;
+                font-weight: bold;
+            }}
+        """)
+        rate_input.setMinimumHeight(38)
+
+        try:
+            rate_input.setValue(db.get_exchange_rate())
+        except:
+            rate_input.setValue(4100)
+
+        rate_layout.addWidget(rate_input)
+        layout.addWidget(rate_frame)
+
+        vat_frame = QFrame()
+        vat_frame.setStyleSheet(f"background-color: {BG_MAIN}; border-radius: 8px;")
+        vat_layout = QVBoxLayout(vat_frame)
+        vat_layout.setContentsMargins(14, 12, 14, 12)
+        vat_layout.setSpacing(8)
+
+        vat_enabled = QCheckBox("Auto VAT on checkout")
+        vat_enabled.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 13px; font-weight: 600; background: transparent;")
+        vat_layout.addWidget(vat_enabled)
+
+        vat_label = QLabel("VAT Rate")
+        vat_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px; background: transparent;")
+        vat_layout.addWidget(vat_label)
+
+        vat_input = QDoubleSpinBox()
+        vat_input.setRange(0, 100)
+        vat_input.setDecimals(2)
+        vat_input.setSuffix(" %")
+        vat_input.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background-color: {BG_WHITE};
+                color: {GREEN};
+                border: 1.5px solid {GREEN};
+                border-radius: 8px;
+                padding: 7px 10px;
+                font-size: 15px;
+                font-weight: bold;
+            }}
+        """)
+        rate_input.setMinimumHeight(38)
+        vat_layout.addWidget(vat_input)
+
+        try:
+            vat_enabled.setChecked(str(db.get_setting("vat_enabled", "0")) == "1")
+            vat_input.setValue(float(db.get_setting("vat_rate", "0") or 0))
+        except Exception:
+            vat_enabled.setChecked(False)
+            vat_input.setValue(0)
+
+        layout.addWidget(vat_frame)
+
+        layout.addStretch()
+
+        btn_layout = QHBoxLayout()
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {BG_MAIN};
+                color: {TEXT_SECONDARY};
+                border: 1px solid {BORDER};
+                border-radius: 8px;
+                padding: 10px 28px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: #E8E8E8; }}
+        """)
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        save_btn = QPushButton("Save")
+        save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {GREEN};
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px 28px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: {GREEN_DARK}; }}
+        """)
+
+        def save_settings():
             try:
-                db.connect()
-                from database import database_setup
-                database_setup.setup_products_table()
-                database_setup.ensure_inventory_table()
-                database_setup.ensure_transactions_tables()
-                err["value"] = None
+                db.set_exchange_rate(rate_input.value())
+                db.set_setting("vat_enabled", "1" if vat_enabled.isChecked() else "0")
+                db.set_setting("vat_rate", str(vat_input.value()))
+                QMessageBox.information(dialog, "Saved", "Settings saved!")
+                dialog.accept()
             except Exception as e:
-                err["value"] = e
-            finally:
-                done.set()
+                msg_box = QMessageBox(dialog)
+                msg_box.setIcon(QMessageBox.NoIcon)
+                msg_box.setWindowTitle("Error")
+                msg_box.setText(str(e))
+                msg_box.setStandardButtons(QMessageBox.Ok)
+                msg_box.exec()
 
-        threading.Thread(target=worker, daemon=True).start()
-        dlg = ConnectingDialog(self)
+        save_btn.clicked.connect(save_settings)
+        btn_layout.addWidget(save_btn)
 
-        def poll():
-            if done.is_set():
-                dlg.accept()
+        layout.addLayout(btn_layout)
+        self._exec_dialog_with_animation(dialog)
 
-        timer = QTimer(dlg)
-        timer.timeout.connect(poll)
-        timer.start(100)
-        dlg.exec()
-        timer.stop()
+def connect_database(splash=None):
+    """Connects to the DB and runs migrations on a worker thread, pumping
+    the event loop so the splash keeps animating (no separate modal dialog —
+    this IS the loading screen). Returns None on success, or the exception
+    on failure. Call this BEFORE constructing MainWindow."""
+    done = threading.Event()
+    err = {"value": None}
 
-        if err["value"] is not None or getattr(db, "conn", None) is None:
-            error_msg = str(err["value"]) if err["value"] else "Unknown connection error"
-            user_msg = f"Could not connect to database.\n\nError: {error_msg}\n\nThe application will now close."
-            QMessageBox.critical(self, "Database Connection Failed", user_msg, QMessageBox.StandardButton.Ok)
-            sys.exit(1)
-        else:
-            handlers.setup()
+    def worker():
+        try:
+            db.connect()
+            from database import database_setup
+            database_setup.setup_products_table()
+            database_setup.ensure_inventory_table()
+            database_setup.ensure_transactions_tables()
+            database_setup.ensure_table_management_tables()
+            database_setup.ensure_settings_table()
+        except Exception as e:
+            err["value"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    while not done.is_set():
+        QApplication.processEvents()
+        time.sleep(0.01)
+
+    if err["value"] is not None or getattr(db, "conn", None) is None:
+        return err["value"] or RuntimeError("Unknown connection error")
+
+    handlers.setup()
+    return None
 
 
 if __name__ == "__main__":
     app = QApplication([])
     app.setStyle('Fusion')
+
+    splash = SplashScreen()
+    splash.start()
+    # Two pumps, not one: the first flushes the show/paint request, the
+    # second gives the window manager/compositor a moment to actually put
+    # pixels on screen before we go do blocking work. This is what a bare
+    # app.processEvents() call was skipping.
+    app.processEvents()
+    app.processEvents()
+
+    # DB connect + migrations run here, driven by the splash's own status
+    # line — there is no second dialog anymore, so this is genuinely the
+    # only loading screen the user sees.
+    splash.set_status("Connecting to database...")
+    db_error = connect_database(splash)
+    if db_error is not None:
+        splash.close()
+        msg_box = QMessageBox()
+        msg_box.setIcon(QMessageBox.NoIcon)
+        msg_box.setWindowTitle("Database Connection Failed")
+        msg_box.setText(
+            f"Could not connect to database.\n\nError: {db_error}\n\nThe application will now close."
+        )
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.exec()
+        sys.exit(1)
+
+    splash.set_status("Loading...")
     apply_theme("light")
     window = MainWindow()
-    window.show()
+    window.showMaximized()
+    splash.finish()
     QTimer.singleShot(0, window.play_opening_animation)
+
     sys.exit(app.exec())

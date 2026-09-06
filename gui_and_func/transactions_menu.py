@@ -28,8 +28,10 @@ from datetime import datetime, timedelta, timezone
 import threading
 
 try:
-    from .export_utils import export_transactions_to_csv
+    from .export_utils import export_sales_report_bundle, export_sales_report_html, export_transactions_to_csv
 except ImportError:
+    export_sales_report_bundle = None
+    export_sales_report_html = None
     export_transactions_to_csv = None
 
 try:
@@ -91,18 +93,22 @@ class TransactionsDialog(QDialog):
         self.search_edit.setPlaceholderText("Search by Transaction ID...")
         self.search_edit.textChanged.connect(self._on_search_changed)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["ID", "Items", "Total", "Created (GMT+7)"])
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["ID", "Table", "Items", "Subtotal", "Discount", "VAT", "Total", "Created (GMT+7)"])
         self.table.verticalHeader().setVisible(False)
         self.table.itemSelectionChanged.connect(self._on_txn_selected)
         
         self.table.setColumnWidth(0, 80)
-        self.table.setColumnWidth(1, 100)
-        self.table.setColumnWidth(2, 120)
-        self.table.setColumnWidth(3, 200)
+        self.table.setColumnWidth(1, 80)
+        self.table.setColumnWidth(2, 80)
+        self.table.setColumnWidth(3, 100)
+        self.table.setColumnWidth(4, 100)
+        self.table.setColumnWidth(5, 90)
+        self.table.setColumnWidth(6, 110)
+        self.table.setColumnWidth(7, 180)
 
-        self.details_table = QTableWidget(0, 5)
-        self.details_table.setHorizontalHeaderLabels(["Item ID", "Name", "Qty", "Unit Price", "Subtotal"])
+        self.details_table = QTableWidget(0, 6)
+        self.details_table.setHorizontalHeaderLabels(["Item ID", "Name", "Qty", "Unit Price", "Subtotal", "Note"])
         self.details_table.verticalHeader().setVisible(False)
 
         self.details_table.setColumnWidth(0, 100)
@@ -110,10 +116,11 @@ class TransactionsDialog(QDialog):
         self.details_table.setColumnWidth(2, 80)
         self.details_table.setColumnWidth(3, 120)
         self.details_table.setColumnWidth(4, 120)
+        self.details_table.setColumnWidth(5, 220)
         self.details_label = QLabel("Transaction Items")
 
         self.refresh_btn = QPushButton("🔄 Refresh")
-        self.export_btn = QPushButton("📊 Export CSV")
+        self.export_btn = QPushButton("Sales Report")
         self.delete_btn = QPushButton("❌ Delete Selected")
         self.clear_all_btn = QPushButton("🗑️ Clear All History")
         self.close_btn = QPushButton("Close")
@@ -209,10 +216,25 @@ class TransactionsDialog(QDialog):
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    SELECT t.id, COALESCE(COUNT(ti.id),0) AS items, t.total_amount, t.created_at
+                    SELECT
+                        t.id,
+                        COALESCE(t.table_number, '') AS table_number,
+                        COALESCE(COUNT(ti.id), 0) AS items,
+                        COALESCE(t.subtotal_amount, t.total_amount) AS subtotal_amount,
+                        COALESCE(t.discount_amount, 0) AS discount_amount,
+                        COALESCE(t.vat_amount, 0) AS vat_amount,
+                        t.total_amount,
+                        t.created_at
                     FROM transactions t
                     LEFT JOIN transaction_items ti ON ti.transaction_id = t.id
-                    GROUP BY t.id, t.total_amount, t.created_at
+                    GROUP BY
+                        t.id,
+                        t.table_number,
+                        t.subtotal_amount,
+                        t.discount_amount,
+                        t.vat_amount,
+                        t.total_amount,
+                        t.created_at
                     ORDER BY t.id DESC
                     """
                 )
@@ -254,13 +276,25 @@ class TransactionsDialog(QDialog):
             rows = [r for r in rows if text in str(r[0])]
         self._filtered_rows = rows
         self.table.setRowCount(0)
-        for rid, items, total, created_at in rows:
+        for row in rows:
+            rid = row[0]
+            table_number = row[1] or "-"
+            items = row[2]
+            subtotal = row[3]
+            discount = row[4]
+            vat = row[5]
+            total = row[6]
+            created_at = row[7]
             r = self.table.rowCount()
             self.table.insertRow(r)
             self.table.setItem(r, 0, QTableWidgetItem(str(rid)))
-            self.table.setItem(r, 1, QTableWidgetItem(str(items)))
-            self.table.setItem(r, 2, QTableWidgetItem(f"{float(total):.2f}"))
-            self.table.setItem(r, 3, QTableWidgetItem(_to_gmt7_str(created_at)))
+            self.table.setItem(r, 1, QTableWidgetItem(str(table_number)))
+            self.table.setItem(r, 2, QTableWidgetItem(str(items)))
+            self.table.setItem(r, 3, QTableWidgetItem(f"{float(subtotal or 0):.2f}"))
+            self.table.setItem(r, 4, QTableWidgetItem(f"{float(discount or 0):.2f}"))
+            self.table.setItem(r, 5, QTableWidgetItem(f"{float(vat or 0):.2f}"))
+            self.table.setItem(r, 6, QTableWidgetItem(f"{float(total or 0):.2f}"))
+            self.table.setItem(r, 7, QTableWidgetItem(_to_gmt7_str(created_at)))
         self.details_table.setRowCount(0)
 
     def _on_search_changed(self, _text: str):
@@ -282,7 +316,7 @@ class TransactionsDialog(QDialog):
 
     def _populate_details(self, rows):
         self.details_table.setRowCount(0)
-        for item_id, name, qty, unit_price, subtotal in rows:
+        for item_id, name, qty, unit_price, subtotal, note in rows:
             r = self.details_table.rowCount()
             self.details_table.insertRow(r)
             self.details_table.setItem(r, 0, QTableWidgetItem(str(item_id)))
@@ -290,6 +324,7 @@ class TransactionsDialog(QDialog):
             self.details_table.setItem(r, 2, QTableWidgetItem(str(qty)))
             self.details_table.setItem(r, 3, QTableWidgetItem(f"{float(unit_price):.2f}"))
             self.details_table.setItem(r, 4, QTableWidgetItem(f"{float(subtotal):.2f}"))
+            self.details_table.setItem(r, 5, QTableWidgetItem(str(note or "")))
 
     def _load_details_async(self, txn_id: int):
         done = threading.Event()
@@ -303,7 +338,7 @@ class TransactionsDialog(QDialog):
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    SELECT ti.item_id, i.name, ti.quantity, ti.unit_price, ti.subtotal
+                    SELECT ti.item_id, i.name, ti.quantity, ti.unit_price, ti.subtotal, COALESCE(ti.note, '') AS note
                     FROM transaction_items ti
                     LEFT JOIN inventory_items i ON i.id = ti.item_id
                     WHERE ti.transaction_id = ?
@@ -342,12 +377,12 @@ class TransactionsDialog(QDialog):
         timer.start(100)
     
     def _export_csv(self):
-        if export_transactions_to_csv and self._filtered_rows:
-            export_transactions_to_csv(self._filtered_rows, self)
+        if export_sales_report_bundle and self._filtered_rows:
+            export_sales_report_bundle(self._filtered_rows, self)
         elif not self._filtered_rows:
             show_message(self, "No Data", "No transactions to export", QMessageBox.Icon.Information)
         else:
-            show_message(self, "Not Available", "Export functionality not available", QMessageBox.Icon.Warning)
+            show_message(self, "Not Available", "Report export functionality not available", QMessageBox.Icon.Warning)
     
     def _delete_selected_transaction(self):
         sel = self.table.selectedItems()
@@ -357,7 +392,7 @@ class TransactionsDialog(QDialog):
         
         row = sel[0].row()
         txn_id = int(self.table.item(row, 0).text())
-        txn_total = self.table.item(row, 2).text()
+        txn_total = self.table.item(row, 6).text()
         
         restore_msg = QMessageBox(self)
         restore_msg.setIcon(QMessageBox.Question)

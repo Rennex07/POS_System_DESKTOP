@@ -121,16 +121,20 @@ def connect() -> Tuple[sqlite3.Connection, sqlite3.Cursor]:
         try:
             db_path = get_db_path()
             
+            if not os.path.exists(db_path):
+                searched_paths = "\n".join(f"- {path}" for path in get_db_search_paths())
+                raise FileNotFoundError(
+                    f"Database file not found: {db_path}\n\n"
+                    f"Searched locations:\n{searched_paths}\n\n"
+                    "Please ensure storage.db exists next to the executable or in the project root."
+                )
+            
             conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             
             cursor.execute("PRAGMA foreign_keys = ON")
             cursor.execute("PRAGMA journal_mode = DELETE")
-            
-            from .database_setup import ensure_inventory_table, ensure_transactions_tables
-            ensure_inventory_table()
-            ensure_transactions_tables()
             
             logger.info(f"Database connected: {db_path}")
             return conn, cursor
@@ -196,6 +200,14 @@ def set_setting(key: str, value: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to set setting '{key}': {e}")
         return False
+
+
+def get_exchange_rate() -> int:
+    return int(get_setting("exchange_rate", "4100"))
+
+
+def set_exchange_rate(rate: int) -> bool:
+    return set_setting("exchange_rate", str(rate))
 
 
 def execute_with_retry(query, params=None, retries=3):

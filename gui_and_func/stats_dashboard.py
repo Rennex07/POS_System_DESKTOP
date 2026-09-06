@@ -314,7 +314,7 @@ class StatsDashboard(QDialog):
             
             data = result["data"]
             if not data:
-                QMessageBox.warning(self, "No Data", "No statistics data was loaded. Database may be empty.")
+                QMessageBox.NoIcon(self, "No Data", "No statistics data was loaded. Database may be empty.")
                 return
             self._update_metric(self.total_sales_label, f"${data['total_sales']:,.2f}")
             self._update_metric(self.total_transactions_label, f"{data['txn_count']:,}")
@@ -415,7 +415,7 @@ class StatsDashboard(QDialog):
                     dialog.accept()
                 else:
                     status_label.setText(f"Error: {result['error']}")
-                    QMessageBox.warning(dialog, "Export Failed", result["error"])
+                    QMessageBox.NoIcon(dialog, "Export Failed", result["error"])
             
             self._run_async(worker, on_done)
         
@@ -457,7 +457,7 @@ class StatsDashboard(QDialog):
                 else:
                     status_label.setText(f"Error: {result['error']}")
                     if "cancelled" not in result["error"].lower():
-                        QMessageBox.warning(dialog, "Export Failed", result["error"])
+                        QMessageBox.NoIcon(dialog, "Export Failed", result["error"])
             
             self._run_async(worker, on_done)
         
@@ -548,6 +548,7 @@ class StatsDashboard(QDialog):
                 
                 f.write("KEY METRICS\n")
                 f.write("-" * 60 + "\n")
+                # Extract current values from UI
                 for label, frame in [
                     ("Total Sales", self.total_sales_label),
                     ("Transactions", self.total_transactions_label),
